@@ -951,7 +951,8 @@
   }
   .gc-del-btn,
   .gc-react-btn,
-  .gc-reply-btn {
+  .gc-reply-btn,
+  .gc-edit-btn {
     background: rgba(0,0,0,0.35);
     border: none;
     color: var(--lavender);
@@ -970,6 +971,49 @@
   .gc-react-btn:hover { background: var(--mint); color: #14322A; }
   .gc-reply-btn { font-size: 13px; }
   .gc-reply-btn:hover { background: var(--lavender); color: #241C33; }
+  .gc-edit-btn { font-size: 12px; }
+  .gc-edit-btn:hover { background: var(--lavender); color: #241C33; }
+
+  .gc-edited-label {
+    font-size: 11px;
+    color: var(--lavender-dim);
+    margin-left: 4px;
+  }
+
+  .gc-edit-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 100%;
+  }
+  .gc-edit-textarea {
+    width: 100%;
+    min-width: 180px;
+    resize: vertical;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid var(--line);
+    border-radius: var(--bubble-r, 14px);
+    color: var(--cream);
+    font: inherit;
+    padding: 8px 12px;
+    box-sizing: border-box;
+  }
+  .gc-edit-form:focus-within .gc-edit-textarea { border-color: var(--focus-ring); }
+  .gc-edit-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+  .gc-edit-actions button {
+    border: none;
+    border-radius: var(--ui-radius, 9px);
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .gc-edit-save { background: var(--mint); color: #14322A; }
+  .gc-edit-cancel { background: rgba(255,255,255,0.12); color: var(--lavender); }
 
   .gc-reply-banner {
     display: flex;
@@ -2119,10 +2163,18 @@
     </form>
   </div>
 
-  <div class="gc-name-gate" id="gc-name-gate" role="dialog" aria-modal="true" aria-labelledby="gc-gate-title">
+  <div class="gc-name-gate" id="gc-welcome-gate" role="dialog" aria-modal="true" aria-labelledby="gc-welcome-title">
+    <div class="gc-name-gate-avatar" aria-hidden="true">👋</div>
+    <h2 id="gc-welcome-title">Welcome to Loopline</h2>
+    <p>A simple, cozy space to chat with everyone else viewing this page.</p>
+    <form class="gc-name-gate-field" id="gc-welcome-form">
+      <button type="submit" id="gc-welcome-continue">Get started</button>
+    </form>
+  </div>
+
+  <div class="gc-name-gate" id="gc-name-gate" role="dialog" aria-modal="true" aria-labelledby="gc-gate-title" hidden>
     <div class="gc-name-gate-avatar" id="gc-name-gate-avatar" aria-hidden="true">?</div>
-    <h2 id="gc-gate-title">Join #general</h2>
-    <p>Pick a name to chat with everyone else viewing this page.</p>
+    <p id="gc-gate-title">Pick a name to chat with everyone else viewing this page.</p>
     <form class="gc-name-gate-field" id="gc-name-gate-form">
       <label for="gc-name-input">Your name (USE YOUR PERSONAL NAME)</label>
       <input id="gc-name-input" maxlength="18" placeholder="Your name" autocomplete="name" />
@@ -2153,6 +2205,26 @@
   };
 
   firebase.initializeApp(firebaseConfig);
+
+  // ---- Service worker (enables background OS notifications) ----
+  // Registering this is what lets browsers that refuse `new Notification()`
+  // from the page (e.g. Android Chrome) show a notification anyway, via
+  // registration.showNotification(). Requires being served over https (or
+  // localhost) - GitHub Pages qualifies. Safe to no-op anywhere else: if
+  // registration fails (e.g. opened as a local file), swRegistration just
+  // stays null and handleIncomingForNotification falls back to the old
+  // `new Notification()` path further down.
+  let swRegistration = null;
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js')
+      .then((reg) => { swRegistration = reg; })
+      .catch((err) => console.warn('Service worker registration failed, background OS notifications may not work on this browser:', err));
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      if (event.data && event.data.type === 'gc-notification-click' && event.data.channelId) {
+        switchChannel(event.data.channelId);
+      }
+    });
+  }
 
   // ---- Keyboard-aware viewport height ----
   // 100dvh is handled inconsistently across mobile browsers once the
@@ -2391,6 +2463,8 @@
   // ---- Elements ----
   const gate = document.getElementById('gc-name-gate');
   const gateAvatar = document.getElementById('gc-name-gate-avatar');
+  const welcomeGate = document.getElementById('gc-welcome-gate');
+  const welcomeForm = document.getElementById('gc-welcome-form');
   const nameGateForm = document.getElementById('gc-name-gate-form');
   const nameInput = document.getElementById('gc-name-input');
   const nameError = document.getElementById('gc-name-gate-error');
@@ -2525,6 +2599,7 @@
   let lastAnnouncedTs = null;     // guards against re-announcing history on load/switch
   let knownKeys = new Set();      // message keys already rendered, so we only animate new ones
   let currentMessagesByKey = {};  // latest snapshot, keyed by message id, for reply lookups
+  let editingKey = null;          // message key currently shown as an inline edit form, if any
   let replyingTo = null;          // { key, user, snippet } for the message currently being replied to
   let activeEmojiCategory = 'smileys';
   let myPresenceRef = null;
@@ -2532,6 +2607,7 @@
 
   // ---- Notifications ----
   let notificationsEnabled = true;    // in-app sound/toast alerts, on by default, no permission needed
+  let hasWarnedNotifUnsupported = false;
   const unreadCounts = {};            // { channelId: count }, badges + title
   const channelWatchers = new Map();  // channelId -> firebase ref, for unread tracking
   let notifWatchStartTs = null;       // set once the user joins, ignores anything sent earlier
@@ -2776,13 +2852,33 @@
     // toast + sound above is enough, an OS popup on top would be redundant.
     if (!websiteActive
       && 'Notification' in window && Notification.permission === 'granted') {
-      try {
-        const n = new Notification(`${message.user} in #${channelName}`, {
-          body: preview,
-          tag: 'gc-' + channelId,
-        });
-        n.onclick = () => { window.focus(); switchChannel(channelId); n.close(); };
-      } catch (e) { /* Notification constructor unsupported in this context */ }
+      const notifOptions = {
+        body: preview,
+        tag: 'gc-' + channelId,
+        data: { channelId },
+      };
+      if (swRegistration && swRegistration.showNotification) {
+        // Preferred path - works on browsers (e.g. Android Chrome) that
+        // block the direct constructor below.
+        swRegistration.showNotification(`${message.user} in #${channelName}`, notifOptions)
+          .catch((err) => console.warn('showNotification failed:', err));
+      } else {
+        try {
+          const n = new Notification(`${message.user} in #${channelName}`, notifOptions);
+          n.onclick = () => { window.focus(); switchChannel(channelId); n.close(); };
+        } catch (e) {
+          // Some mobile browsers (notably Android Chrome) refuse to construct
+          // a Notification directly from page script - they require it to go
+          // through a service worker's showNotification() instead, and throw
+          // "Illegal constructor" here. That's silent otherwise, so surface it
+          // once per session rather than the OS popup just mysteriously never
+          // showing up while everything else (sound, in-app toast) works fine.
+          if (!hasWarnedNotifUnsupported) {
+            hasWarnedNotifUnsupported = true;
+            showSystemToast('Your browser blocks background pop-up alerts on this device (sound and in-app alerts still work).', '🔕');
+          }
+        }
+      }
     }
     playPing();
   }
@@ -3103,16 +3199,28 @@
   // the page for IDLE_LIMIT_MS, their presence entry is removed so they
   // drop out of the online list, and reappears automatically the moment
   // they come back.
+  //
+  // Separately, switching away from this tab entirely (another tab, another
+  // app, minimized) drops presence much faster, after HIDDEN_AWAY_MS -
+  // being "active" 30 seconds ago on a tab you've since left isn't really
+  // being online.
   const IDLE_LIMIT_MS = 2 * 60 * 1000;
+  const HIDDEN_AWAY_MS = 30 * 1000;
   let lastActivityTs = Date.now();
   let isPresentNow = false;
+  let hiddenSinceTs = document.visibilityState === 'hidden' ? Date.now() : null;
 
   function markActive() { lastActivityTs = Date.now(); }
   ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'wheel', 'click'].forEach(ev => {
     window.addEventListener(ev, markActive, { passive: true });
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') markActive();
+    if (document.visibilityState === 'visible') {
+      hiddenSinceTs = null;
+      markActive();
+    } else {
+      hiddenSinceTs = Date.now();
+    }
   });
 
   function addPresence() {
@@ -3129,17 +3237,20 @@
   function setupPresence() {
     db.ref('.info/connected').on('value', (snap) => {
       if (snap.val() === false) { isPresentNow = false; return; }
-      if (Date.now() - lastActivityTs < IDLE_LIMIT_MS) addPresence();
+      const hiddenTooLong = hiddenSinceTs !== null && (Date.now() - hiddenSinceTs) >= HIDDEN_AWAY_MS;
+      if (!hiddenTooLong && Date.now() - lastActivityTs < IDLE_LIMIT_MS) addPresence();
     });
   }
-  // Check idle state regularly: drop presence once idle too long, restore
-  // it the moment activity resumes.
+  // Check idle/away state regularly: drop presence once idle too long or the
+  // tab's been out of view for HIDDEN_AWAY_MS, restore it the moment the
+  // person is back and active.
   setInterval(() => {
     if (!username) return;
     const idleFor = Date.now() - lastActivityTs;
-    if (idleFor >= IDLE_LIMIT_MS) removePresence();
+    const hiddenTooLong = hiddenSinceTs !== null && (Date.now() - hiddenSinceTs) >= HIDDEN_AWAY_MS;
+    if (idleFor >= IDLE_LIMIT_MS || hiddenTooLong) removePresence();
     else addPresence();
-  }, 10000);
+  }, 5000);
   window.addEventListener('beforeunload', () => {
     if (myPresenceRef) myPresenceRef.remove();
   });
@@ -3563,10 +3674,13 @@
         bodyHtml = `<div class="gc-bubble">${linkify(escapeHtml(m.text || ''))}</div>`;
       }
       const canDelete = mine || isDeveloper;
+      const canEdit = mine && (m.type === 'text' || m.type === 'emoji' || !m.type);
       const delBtn = canDelete ? `<button type="button" class="gc-del-btn" data-key="${key}" aria-label="Delete this message" title="Delete message">✕</button>` : '';
+      const editBtn = canEdit ? `<button type="button" class="gc-edit-btn" data-key="${key}" aria-label="Edit this message" title="Edit message">✎</button>` : '';
       const reactBtn = `<button type="button" class="gc-react-btn" data-key="${key}" aria-haspopup="true" aria-label="Add reaction" title="Add reaction">🙂+</button>`;
       const replyBtn = `<button type="button" class="gc-reply-btn" data-key="${key}" aria-label="Reply to this message" title="Reply">↩</button>`;
       const reactionsHtml = renderReactions(key, m.reactions);
+      const editedLabel = m.edited ? `<span class="gc-edited-label">(edited)</span>` : '';
       const replyQuoteHtml = m.replyTo
         ? `<div class="gc-reply-quote" data-goto="${escapeHtml(m.replyTo.key || '')}">
              <span class="gc-reply-quote-name">${escapeHtml(m.replyTo.user || '')}</span>
@@ -3574,16 +3688,26 @@
            </div>`
         : '';
       const isNew = !isFirstRenderForChannel && !knownKeys.has(key);
+      if (editingKey === key && canEdit) {
+        bodyHtml = `
+          <form class="gc-edit-form" data-key="${key}">
+            <textarea class="gc-edit-textarea" rows="2">${escapeHtml(m.text || '')}</textarea>
+            <div class="gc-edit-actions">
+              <button type="button" class="gc-edit-cancel">Cancel</button>
+              <button type="submit" class="gc-edit-save">Save</button>
+            </div>
+          </form>`;
+      }
       return `
         <div class="gc-msg-row ${mine ? 'mine' : ''} ${isNew ? 'gc-enter' : ''}" data-key="${key}">
-          <div class="gc-msg-actions">${reactBtn}${replyBtn}${delBtn}</div>
+          <div class="gc-msg-actions">${reactBtn}${replyBtn}${editBtn}${delBtn}</div>
           <div class="gc-avatar" style="background:${bg}" aria-hidden="true">${initials(m.user)}</div>
           <div class="gc-bubble-wrap">
             <div class="gc-name-line">${mine ? 'You' : escapeHtml(m.user)}</div>
             ${replyQuoteHtml}
             ${bodyHtml}
             ${reactionsHtml}
-            <div class="gc-time">${timeStr(m.ts)}</div>
+            <div class="gc-time">${timeStr(m.ts)}${editedLabel}</div>
           </div>
         </div>`;
     }).join('');
@@ -3594,6 +3718,47 @@
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         messagesRef.child(btn.dataset.key).remove();
+      });
+    });
+    messagesEl.querySelectorAll('.gc-edit-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        editingKey = btn.dataset.key;
+        renderMessages(Object.entries(currentMessagesByKey));
+      });
+    });
+    messagesEl.querySelectorAll('.gc-edit-form').forEach(form => {
+      const textarea = form.querySelector('.gc-edit-textarea');
+      const cancelBtn = form.querySelector('.gc-edit-cancel');
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      textarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          form.requestSubmit();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          editingKey = null;
+          renderMessages(Object.entries(currentMessagesByKey));
+        }
+      });
+      cancelBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        editingKey = null;
+        renderMessages(Object.entries(currentMessagesByKey));
+      });
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const key = form.dataset.key;
+        const newText = textarea.value.trim();
+        if (!newText) return;
+        messagesRef.child(key).update({ text: newText, edited: true, editedTs: Date.now() }).then(() => {
+          editingKey = null;
+        }).catch((err) => {
+          console.error(err);
+          showSystemToast('Could not save your edit, try again.');
+        });
       });
     });
     messagesEl.querySelectorAll('.gc-react-btn').forEach(btn => {
@@ -4135,7 +4300,11 @@
       n.classList.contains('gc-react-btn') ||
       n.classList.contains('gc-reaction-pill') ||
       n.classList.contains('gc-reaction-popover') ||
-      n.classList.contains('gc-reaction-full-picker')
+      n.classList.contains('gc-reaction-full-picker') ||
+      n.classList.contains('gc-edit-btn') ||
+      n.classList.contains('gc-edit-form') ||
+      n.classList.contains('gc-edit-textarea') ||
+      n.classList.contains('gc-edit-actions')
     ));
     if (insideReactionUI) return;
     const openRows = messagesEl.querySelectorAll('.gc-msg-row.show-del');
@@ -4450,6 +4619,29 @@
   }
   gate.addEventListener('keydown', trapFocusInGate);
 
+  // ---- Welcome gate ----
+  function trapFocusInWelcome(e) {
+    if (welcomeGate.hidden || e.key !== 'Tab') return;
+    const focusable = welcomeGate.querySelectorAll('input, button');
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+  welcomeGate.addEventListener('keydown', trapFocusInWelcome);
+  function continueToNameGate() {
+    welcomeGate.hidden = true;
+    welcomeGate.style.display = 'none';
+    gate.hidden = false;
+    gate.style.display = '';
+    nameInput.focus();
+  }
+  if (welcomeForm) welcomeForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    continueToNameGate();
+  });
+
   function join(name) {
     username = name.slice(0, 18);
     youNameEl.textContent = username;
@@ -4535,9 +4727,16 @@
     appBlocked = false;
     multiTabGate.hidden = true;
     if (!username) {
-      // Never joined in this tab yet, bring the join screen back so they can.
-      gate.hidden = false;
-      gate.style.display = '';
+      // Never joined in this tab yet, bring back whichever screen they were
+      // on: the name gate if they'd already gotten past welcome, otherwise
+      // the welcome screen.
+      if (welcomeGate.hidden) {
+        gate.hidden = false;
+        gate.style.display = '';
+      } else {
+        welcomeGate.hidden = false;
+        welcomeGate.style.display = '';
+      }
     }
     // If username is already set, this tab had already joined before losing
     // the lock, and the chat UI underneath is still intact, nothing else to restore.
@@ -4625,7 +4824,8 @@
     }, 350);
   }
 
-  nameInput.focus();
+  const welcomeContinueBtn = document.getElementById('gc-welcome-continue');
+  if (welcomeContinueBtn) welcomeContinueBtn.focus();
 })();
 </script>
 </body>
