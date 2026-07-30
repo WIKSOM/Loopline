@@ -1,1 +1,8 @@
 # Loopline
+IS CURRENTLy DOWN
+
+REASONS
+Updating
+Bugged
+
+PLEASE REFRESH
