@@ -63,12 +63,25 @@ const PRESENCE_STALE_MS = 25000;
 
 async function pushToEveryoneExcept(senderName, channelId, title, body) {
   const senderKey = keySafe(senderName);
-  const [subsSnap, presenceSnap] = await Promise.all([
+  const [subsSnap, presenceSnap, accessSnap] = await Promise.all([
     db.ref('pushSubscriptions').get(),
     db.ref('activePresence').get(),
+    db.ref('channelAccess').child(channelId).get(),
   ]);
   const subsByUser = subsSnap.val() || {};
   const presenceByUser = presenceSnap.val() || {};
+
+  // Mirror the client's canAccessChannel()/canWatchChannelForNotifications():
+  // restricted channels and DMs only notify people on the allowed list.
+  // Without this, every subscriber got a push preview of every private
+  // message. Fails closed - if the access record says restricted, only
+  // listed people are pushed to.
+  const access = accessSnap.val();
+  const isRestricted = !!(access && access.restricted);
+  const allowedKeys = new Set(Object.keys((access && access.allowed) || {}).map(keySafe));
+  if (access && Array.isArray(access.dm)) access.dm.forEach((n) => allowedKeys.add(keySafe(n)));
+  const isDM = !!(access && Array.isArray(access.dm));
+  if (isDM) title = `${senderName} messaged you`;
 
   const payload = JSON.stringify({ title, body, channelId: String(channelId) });
   const staleKeys = [];
@@ -77,6 +90,7 @@ async function pushToEveryoneExcept(senderName, channelId, title, body) {
   await Promise.all(
     Object.entries(subsByUser).map(async ([userKey, entry]) => {
       if (userKey === senderKey || !entry || !entry.subscription) return;
+      if (isRestricted && !allowedKeys.has(userKey)) return;
 
       // Skip the push if this person is actively looking at this exact
       // channel right now - the page's own realtime listener already
@@ -153,4 +167,19 @@ db.ref('channelNames').on('value', (snap) => {
 // ---- Tiny HTTP server, mostly so Render sees the service as "up" ----
 const app = express();
 app.get('/', (_req, res) => res.send('Loopline push server is running.'));
+app.get('/healthz', (_req, res) => res.send('ok'));
 app.listen(PORT, () => console.log(`Loopline push server listening on port ${PORT}`));
+
+// ---- Keep-alive ----
+// Render's free tier spins a service down after ~15 min with no incoming
+// HTTP requests, which kills the Firebase listeners above and silently stops
+// all pushes. Render sets RENDER_EXTERNAL_URL automatically; pinging it
+// counts as incoming traffic and keeps the service awake while it's up.
+// If it ever does fall asleep, an external pinger (e.g. UptimeRobot hitting
+// the same URL every 5 minutes) is what wakes it again - see README.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(SELF_URL + '/healthz').catch((err) => console.warn('Keep-alive ping failed:', err.message));
+  }, 10 * 60 * 1000);
+}
