@@ -32,6 +32,8 @@ self.addEventListener('push', (event) => {
   const title = data.title || 'Loopline';
   const options = {
     body: data.body || '',
+    icon: 'icon-192.png',
+    badge: 'icon-192.png',
     tag: data.channelId ? ('gc-' + data.channelId) : undefined,
     // Without this, a second push sharing the same tag (i.e. another
     // message in a channel that already has a shown-but-undismissed
